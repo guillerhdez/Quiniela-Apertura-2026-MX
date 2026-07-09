@@ -1,9 +1,0 @@
-{
-  "name": "quiniela-recordatorios",
-  "private": true,
-  "version": "1.0.0",
-  "description": "Script de GitHub Actions que manda recordatorios push 1 hora antes del primer partido de cada jornada/fase.",
-  "dependencies": {
-    "web-push": "^3.6.7"
-  }
-}
