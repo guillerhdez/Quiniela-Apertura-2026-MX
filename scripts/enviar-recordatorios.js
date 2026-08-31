@@ -4,9 +4,18 @@
 // Corre cada 15 minutos. Lee el fixture directo del index.html YA PUBLICADO
 // en Netlify (una sola fuente de verdad, no se duplica el fixture aquí).
 // Para cada Jornada (1-17) y cada fase de Liguilla (Cuartos/Semis/Final),
-// busca el PRIMER partido por fecha+hora. Si faltan entre 45 y 75 minutos
-// para ese kickoff, y no se ha notificado ya esa jornada/fase, manda un
-// push a todas las suscripciones guardadas en Firebase.
+// busca el PRIMER partido por fecha+hora.
+//
+// Ventana de recordatorios: entre 90 y 30 minutos antes de ese kickoff
+// (el bloqueo de predicciones del index.html ocurre a los 30 min, así que
+// no tiene caso notificar después de eso). Dentro de esa ventana se manda
+// UN aviso por cada corte de 15 min (90, 75, 60, 45, 30 → hasta 5 avisos
+// por jornada/fase), cada uno marcado por separado en
+// notificado/{key}/{slot} para no duplicarse entre corridas del cron.
+//
+// Antes de cada envío se filtran los suscriptores que YA tengan guardada
+// una predicción válida para el primer partido de esa jornada/fase — a
+// ellos se les omite el push (ya no lo necesitan), sin afectar al resto.
 //
 // Liguilla: FECHA_LIGUILLA hoy son textos como "Por definir" o "25-26 nov"
 // (no una hora exacta) — mientras no tengan el formato estricto
@@ -27,8 +36,10 @@ webpush.setVapidDetails(
   VAPID_PRIVATE_KEY
 );
 
-const VENTANA_MIN_MINUTOS = 45;
-const VENTANA_MAX_MINUTOS = 75;
+const VENTANA_MIN_MINUTOS = 30; // límite inferior: coincide con el bloqueo de predicciones
+const VENTANA_MAX_MINUTOS = 90; // límite superior: 1.5 horas antes del primer partido
+const SLOTS = [90, 75, 60, 45, 30]; // cortes de aviso dentro de la ventana
+const TOLERANCIA_MIN = 7; // margen para que un cron con leve retraso siga cayendo en su slot
 
 async function fbGet(path) {
   const res = await fetch(`${FB}/${path}.json`);
@@ -71,6 +82,7 @@ function buildGroups(PG_LIGAMX, FECHA_LIGUILLA) {
 
   for (let n = 1; n <= 17; n++) {
     const partidos = PG_LIGAMX.filter((p) => p.jornada === n).map((p) => ({
+      id: p.id,
       fecha: p.fecha,
       hora: p.hora,
     }));
@@ -85,11 +97,11 @@ function buildGroups(PG_LIGAMX, FECHA_LIGUILLA) {
 
   for (const fase of fasesLiguilla) {
     const partidos = fase.ids
-      .map((id) => FECHA_LIGUILLA[id])
-      .filter(Boolean)
-      .map((raw) => {
+      .map((id) => ({ id, raw: FECHA_LIGUILLA[id] }))
+      .filter((x) => x.raw)
+      .map(({ id, raw }) => {
         const m = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/.exec(String(raw).trim());
-        return m ? { fecha: m[1], hora: m[2] } : null;
+        return m ? { id, fecha: m[1], hora: m[2] } : null;
       })
       .filter(Boolean);
     groups.push({ key: fase.key, label: fase.label, partidos });
@@ -106,16 +118,30 @@ function primerKickoff(partidos) {
   return validos[0] || null;
 }
 
-async function enviarATodos(label) {
-  const subs = (await fbGet("pushSubs")) || {};
+// Redondea los minutos restantes al corte de 15 más cercano y sólo lo
+// acepta si cae dentro de SLOTS y dentro de la tolerancia — así un cron
+// con unos minutos de retraso sigue detectando el corte correcto.
+function slotMasCercano(minutosPara) {
+  const redondeado = Math.round(minutosPara / 15) * 15;
+  if (!SLOTS.includes(redondeado)) return null;
+  if (Math.abs(minutosPara - redondeado) > TOLERANCIA_MIN) return null;
+  return redondeado;
+}
+
+function yaPredijo(predicciones, uid, matchId) {
+  const pred = (predicciones[uid] || {})[matchId];
+  return !!pred && pred.gl !== "" && pred.gv !== "" && pred.gl != null && pred.gv != null;
+}
+
+async function enviarASubscriptores(subs, label, slot) {
   const payload = JSON.stringify({
     title: "Quiniela Apertura 2026",
-    body: `⚽ Recordatorio: ${label} empieza en 1 hora. No olvides meter tus predicciones.`,
+    body: `⚽ Recordatorio: ${label} empieza en ${slot} minutos. No olvides meter tus predicciones.`,
     tag: "quiniela-recordatorio",
   });
 
   const entries = Object.entries(subs);
-  console.log(`Enviando a ${entries.length} suscripción(es) para: ${label}`);
+  console.log(`Enviando a ${entries.length} suscripción(es) para: ${label} (faltan ${slot} min)`);
 
   for (const [uid, sub] of entries) {
     try {
@@ -141,6 +167,9 @@ async function main() {
   const groups = buildGroups(PG_LIGAMX, FECHA_LIGUILLA);
   const now = Date.now();
 
+  // Primero determinamos qué grupos caen en un slot válido de la ventana,
+  // sin tocar Firebase todavía.
+  const gruposEnVentana = [];
   for (const group of groups) {
     const primero = primerKickoff(group.partidos);
     if (!primero) continue;
@@ -148,12 +177,42 @@ async function main() {
     const minutosPara = (primero.ts - now) / 60000;
     if (minutosPara < VENTANA_MIN_MINUTOS || minutosPara > VENTANA_MAX_MINUTOS) continue;
 
-    const yaNotificado = await fbGet(`notificado/${group.key}`).catch(() => null);
+    const slot = slotMasCercano(minutosPara);
+    if (slot === null) continue;
+
+    gruposEnVentana.push({ group, primero, slot });
+  }
+
+  if (gruposEnVentana.length === 0) {
+    console.log("Ningún grupo cae en un corte de aviso en este ciclo.");
+    return;
+  }
+
+  // Sólo pedimos subs y predicciones si de verdad hay algo que evaluar,
+  // y las pedimos una sola vez para todos los grupos de este ciclo.
+  const [subsTodas, predicciones] = await Promise.all([
+    fbGet("pushSubs").then((v) => v || {}),
+    fbGet("predicciones").then((v) => v || {}),
+  ]);
+
+  for (const { group, primero, slot } of gruposEnVentana) {
+    const yaNotificado = await fbGet(`notificado/${group.key}/${slot}`).catch(() => null);
     if (yaNotificado) continue;
 
-    await enviarATodos(group.label);
-    await fbSet(`notificado/${group.key}`, true);
-    console.log(`✓ Notificado: ${group.label}`);
+    const subsAEnviar = Object.fromEntries(
+      Object.entries(subsTodas).filter(([uid]) => !yaPredijo(predicciones, uid, primero.id))
+    );
+    const omitidos = Object.keys(subsTodas).length - Object.keys(subsAEnviar).length;
+    if (omitidos > 0) {
+      console.log(`${omitidos} suscriptor(es) omitido(s) por ya tener predicción de ${group.label}`);
+    }
+
+    if (Object.keys(subsAEnviar).length > 0) {
+      await enviarASubscriptores(subsAEnviar, group.label, slot);
+    }
+
+    await fbSet(`notificado/${group.key}/${slot}`, true);
+    console.log(`✓ Notificado (slot ${slot} min): ${group.label}`);
   }
 }
 
