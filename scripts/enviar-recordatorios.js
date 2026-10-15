@@ -6,12 +6,15 @@
 // Para cada Jornada (1-17) y cada fase de Liguilla (Cuartos/Semis/Final),
 // busca el PRIMER partido por fecha+hora.
 //
-// Ventana de recordatorios: entre 90 y 30 minutos antes de ese kickoff
+// Recordatorios: SOLO 2 avisos por jornada/fase, uno "de 90" y otro "de 60"
+// minutos antes de ese kickoff. Como el cron de GitHub puede llegar con
+// retraso, cada aviso tiene un rango de alcance:
+//   - aviso de 90: se envía si faltan entre 75 y 90 minutos
+//   - aviso de 60: se envía si faltan entre 45 y 60 minutos
 // (el bloqueo de predicciones del index.html ocurre a los 30 min, así que
-// no tiene caso notificar después de eso). Dentro de esa ventana se manda
-// UN aviso por cada corte de 15 min (90, 75, 60, 45, 30 → hasta 5 avisos
-// por jornada/fase), cada uno marcado por separado en
-// notificado/{key}/{slot} para no duplicarse entre corridas del cron.
+// no se notifica después). El texto del push dice los minutos REALES que
+// faltan (redondeados). Cada aviso queda marcado por separado en
+// notificado/{key}/{90|60} para no duplicarse entre corridas del cron.
 //
 // Antes de cada envío se filtran los suscriptores que YA tengan guardada
 // una predicción válida para el primer partido de esa jornada/fase — a
@@ -36,10 +39,13 @@ webpush.setVapidDetails(
   VAPID_PRIVATE_KEY
 );
 
-const VENTANA_MIN_MINUTOS = 30; // límite inferior: coincide con el bloqueo de predicciones
+const VENTANA_MIN_MINUTOS = 45; // límite inferior: fin del alcance del aviso de 60
 const VENTANA_MAX_MINUTOS = 90; // límite superior: 1.5 horas antes del primer partido
-const SLOTS = [90, 75, 60, 45, 30]; // cortes de aviso dentro de la ventana
-const TOLERANCIA_MIN = 7; // margen para que un cron con leve retraso siga cayendo en su slot
+// Rangos de alcance por aviso: { slot, desde (excluyente), hasta (incluyente) } en minutos restantes.
+const RANGOS_AVISO = [
+  { slot: 90, desde: 75, hasta: 90 },
+  { slot: 60, desde: 45, hasta: 60 },
+];
 
 async function fbGet(path) {
   const res = await fetch(`${FB}/${path}.json`);
@@ -118,14 +124,13 @@ function primerKickoff(partidos) {
   return validos[0] || null;
 }
 
-// Redondea los minutos restantes al corte de 15 más cercano y sólo lo
-// acepta si cae dentro de SLOTS y dentro de la tolerancia — así un cron
-// con unos minutos de retraso sigue detectando el corte correcto.
-function slotMasCercano(minutosPara) {
-  const redondeado = Math.round(minutosPara / 15) * 15;
-  if (!SLOTS.includes(redondeado)) return null;
-  if (Math.abs(minutosPara - redondeado) > TOLERANCIA_MIN) return null;
-  return redondeado;
+// Devuelve 90 o 60 según el rango de alcance en el que caigan los minutos
+// restantes, o null si no corresponde avisar en este momento.
+function slotPara(minutosPara) {
+  for (const r of RANGOS_AVISO) {
+    if (minutosPara > r.desde && minutosPara <= r.hasta) return r.slot;
+  }
+  return null;
 }
 
 function yaPredijo(predicciones, uid, matchId) {
@@ -133,15 +138,15 @@ function yaPredijo(predicciones, uid, matchId) {
   return !!pred && pred.gl !== "" && pred.gv !== "" && pred.gl != null && pred.gv != null;
 }
 
-async function enviarASubscriptores(subs, label, slot) {
+async function enviarASubscriptores(subs, label, minutosReales) {
   const payload = JSON.stringify({
     title: "Quiniela Apertura 2026",
-    body: `⚽ Recordatorio: ${label} empieza en ${slot} minutos. No olvides meter tus predicciones.`,
+    body: `⚽ Recordatorio: ${label} empieza en ${minutosReales} minutos. No olvides meter tus predicciones.`,
     tag: "quiniela-recordatorio",
   });
 
   const entries = Object.entries(subs);
-  console.log(`Enviando a ${entries.length} suscripción(es) para: ${label} (faltan ${slot} min)`);
+  console.log(`Enviando a ${entries.length} suscripción(es) para: ${label} (faltan ~${minutosReales} min)`);
 
   for (const [uid, sub] of entries) {
     try {
@@ -177,10 +182,10 @@ async function main() {
     const minutosPara = (primero.ts - now) / 60000;
     if (minutosPara < VENTANA_MIN_MINUTOS || minutosPara > VENTANA_MAX_MINUTOS) continue;
 
-    const slot = slotMasCercano(minutosPara);
+    const slot = slotPara(minutosPara);
     if (slot === null) continue;
 
-    gruposEnVentana.push({ group, primero, slot });
+    gruposEnVentana.push({ group, primero, slot, minutosPara });
   }
 
   if (gruposEnVentana.length === 0) {
@@ -195,7 +200,7 @@ async function main() {
     fbGet("predicciones").then((v) => v || {}),
   ]);
 
-  for (const { group, primero, slot } of gruposEnVentana) {
+  for (const { group, primero, slot, minutosPara } of gruposEnVentana) {
     const yaNotificado = await fbGet(`notificado/${group.key}/${slot}`).catch(() => null);
     if (yaNotificado) continue;
 
@@ -208,11 +213,11 @@ async function main() {
     }
 
     if (Object.keys(subsAEnviar).length > 0) {
-      await enviarASubscriptores(subsAEnviar, group.label, slot);
+      await enviarASubscriptores(subsAEnviar, group.label, Math.round(minutosPara));
     }
 
     await fbSet(`notificado/${group.key}/${slot}`, true);
-    console.log(`✓ Notificado (slot ${slot} min): ${group.label}`);
+    console.log(`✓ Notificado (aviso de ${slot} min, faltaban ~${Math.round(minutosPara)}): ${group.label}`);
   }
 }
 
