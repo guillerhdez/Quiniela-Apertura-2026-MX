@@ -170,11 +170,15 @@ function textoCierre(kickoffTs) {
   return `${dia} ${num} a las ${hh}:${mm} (hora CDMX)`;
 }
 
-async function enviarASubscriptores(subs, label, kickoffTs, minutosReales) {
+// `tag` único por grupo+aviso: si dos avisos compartieran tag, el segundo
+// REEMPLAZARÍA al primero y Android no volvería a sonar. Con tags distintos
+// cada aviso (90 y 60 min, y cada día de Liguilla) es una notificación aparte
+// y alerta normalmente. sw.js ya usa data.tag tal cual, sin cambios allá.
+async function enviarASubscriptores(subs, label, kickoffTs, minutosReales, tag) {
   const payload = JSON.stringify({
     title: `${label}: ¡haz tus pronósticos!`,
     body: `El primer partido cierra el ${textoCierre(kickoffTs)}.`,
-    tag: "quiniela-recordatorio",
+    tag,
   });
 
   const entries = Object.entries(subs);
@@ -235,7 +239,13 @@ async function main() {
 
     // Se envía a TODOS los suscritos, hayan pronosticado o no.
     if (Object.keys(subsTodas).length > 0) {
-      await enviarASubscriptores(subsTodas, group.label, primero.ts, Math.round(minutosPara));
+      await enviarASubscriptores(
+        subsTodas,
+        group.label,
+        primero.ts,
+        Math.round(minutosPara),
+        `quiniela-${group.key}-${slot}`
+      );
     }
 
     await fbSet(`notificado/${group.key}/${slot}`, true);
