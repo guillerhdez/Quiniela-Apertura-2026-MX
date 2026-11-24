@@ -12,17 +12,24 @@
 //   - aviso de 90: se envía si faltan entre 75 y 90 minutos
 //   - aviso de 60: se envía si faltan entre 45 y 60 minutos
 // (el bloqueo de predicciones del index.html ocurre a los 30 min, así que
-// no se notifica después). El texto del push dice los minutos REALES que
-// faltan (redondeados). Cada aviso queda marcado por separado en
+// no se notifica después). Cada aviso queda marcado por separado en
 // notificado/{key}/{90|60} para no duplicarse entre corridas del cron.
 //
-// Antes de cada envío se filtran los suscriptores que YA tengan guardada
-// una predicción válida para el primer partido de esa jornada/fase — a
-// ellos se les omite el push (ya no lo necesitan), sin afectar al resto.
+// Texto del push (igual para todos, hayan pronosticado o no):
+//   Título: "Jornada {N}: ¡haz tus pronósticos!"
+//           (Liguilla: "Partido de Ida: …" / "Partido de Vuelta: …")
+//   Cuerpo: "El primer partido cierra el {día} {número} a las {HH:mm} (hora CDMX)."
+// La hora que se muestra es el CIERRE de predicciones (kickoff − 30 min),
+// calculado en hora CDMX (UTC-6, sin horario de verano), igual que esCerrado()
+// en el index.html. A todos los suscriptores se les envía el aviso: ya no se
+// omite a quien ya pronosticó.
 //
-// Liguilla: FECHA_LIGUILLA hoy son textos como "Por definir" o "25-26 nov"
+// Liguilla: cada fase se divide en grupo de IDA y grupo de VUELTA (ids pares =
+// ida, impares = vuelta, según CUARTOS_SERIES / SEMIS_META / FINAL_META del
+// index.html). Cada grupo avisa por separado con su propio primer partido.
+// FECHA_LIGUILLA hoy son textos como "Por definir" o "2026-11-25 (o 26)"
 // (no una hora exacta) — mientras no tengan el formato estricto
-// "YYYY-MM-DD HH:MM", esa fase simplemente se salta (no es un error).
+// "YYYY-MM-DD HH:MM", ese grupo simplemente se salta (no es un error).
 // ══════════════════════════════════════════════════════════════════════════
 
 const webpush = require("web-push");
@@ -95,10 +102,15 @@ function buildGroups(PG_LIGAMX, FECHA_LIGUILLA) {
     groups.push({ key: `jornada_${n}`, label: `Jornada ${n}`, partidos });
   }
 
+  // Cada fase se separa en IDA y VUELTA (ver CUARTOS_SERIES / SEMIS_META /
+  // FINAL_META en el index.html: idaId pares, vueltaId impares).
   const fasesLiguilla = [
-    { key: "liguilla_cuartos", label: "Cuartos de Final", ids: [154, 155, 156, 157, 158, 159, 160, 161] },
-    { key: "liguilla_semis", label: "Semifinal", ids: [162, 163, 164, 165] },
-    { key: "liguilla_final", label: "Final", ids: [166, 167] },
+    { key: "liguilla_cuartos_ida", label: "Partido de Ida", ids: [154, 156, 158, 160] },
+    { key: "liguilla_cuartos_vuelta", label: "Partido de Vuelta", ids: [155, 157, 159, 161] },
+    { key: "liguilla_semis_ida", label: "Partido de Ida", ids: [162, 164] },
+    { key: "liguilla_semis_vuelta", label: "Partido de Vuelta", ids: [163, 165] },
+    { key: "liguilla_final_ida", label: "Partido de Ida", ids: [166] },
+    { key: "liguilla_final_vuelta", label: "Partido de Vuelta", ids: [167] },
   ];
 
   for (const fase of fasesLiguilla) {
@@ -133,20 +145,30 @@ function slotPara(minutosPara) {
   return null;
 }
 
-function yaPredijo(predicciones, uid, matchId) {
-  const pred = (predicciones[uid] || {})[matchId];
-  return !!pred && pred.gl !== "" && pred.gv !== "" && pred.gl != null && pred.gv != null;
+const DIAS_SEMANA = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+const MINUTOS_CIERRE_ANTES = 30; // mismo criterio que esCerrado() en el index.html
+
+// Cierre de predicciones = kickoff − 30 min, expresado en hora CDMX (UTC-6).
+// Se desplaza el instante −6 h y se leen los campos UTC, así el resultado no
+// depende de la zona horaria del servidor.
+function textoCierre(kickoffTs) {
+  const cierreCDMX = new Date(kickoffTs - MINUTOS_CIERRE_ANTES * 60000 - 6 * 3600000);
+  const dia = DIAS_SEMANA[cierreCDMX.getUTCDay()];
+  const num = cierreCDMX.getUTCDate();
+  const hh = String(cierreCDMX.getUTCHours()).padStart(2, "0");
+  const mm = String(cierreCDMX.getUTCMinutes()).padStart(2, "0");
+  return `${dia} ${num} a las ${hh}:${mm} (hora CDMX)`;
 }
 
-async function enviarASubscriptores(subs, label, minutosReales) {
+async function enviarASubscriptores(subs, label, kickoffTs, minutosReales) {
   const payload = JSON.stringify({
-    title: "Quiniela Apertura 2026",
-    body: `⚽ Recordatorio: ${label} empieza en ${minutosReales} minutos. No olvides meter tus predicciones.`,
+    title: `${label}: ¡haz tus pronósticos!`,
+    body: `El primer partido cierra el ${textoCierre(kickoffTs)}.`,
     tag: "quiniela-recordatorio",
   });
 
   const entries = Object.entries(subs);
-  console.log(`Enviando a ${entries.length} suscripción(es) para: ${label} (faltan ~${minutosReales} min)`);
+  console.log(`Enviando a ${entries.length} suscripción(es) para: ${label} (faltan ~${minutosReales} min al kickoff)`);
 
   for (const [uid, sub] of entries) {
     try {
@@ -193,27 +215,17 @@ async function main() {
     return;
   }
 
-  // Sólo pedimos subs y predicciones si de verdad hay algo que evaluar,
-  // y las pedimos una sola vez para todos los grupos de este ciclo.
-  const [subsTodas, predicciones] = await Promise.all([
-    fbGet("pushSubs").then((v) => v || {}),
-    fbGet("predicciones").then((v) => v || {}),
-  ]);
+  // Sólo pedimos las suscripciones si de verdad hay algo que enviar, y las
+  // pedimos una sola vez para todos los grupos de este ciclo.
+  const subsTodas = await fbGet("pushSubs").then((v) => v || {});
 
   for (const { group, primero, slot, minutosPara } of gruposEnVentana) {
     const yaNotificado = await fbGet(`notificado/${group.key}/${slot}`).catch(() => null);
     if (yaNotificado) continue;
 
-    const subsAEnviar = Object.fromEntries(
-      Object.entries(subsTodas).filter(([uid]) => !yaPredijo(predicciones, uid, primero.id))
-    );
-    const omitidos = Object.keys(subsTodas).length - Object.keys(subsAEnviar).length;
-    if (omitidos > 0) {
-      console.log(`${omitidos} suscriptor(es) omitido(s) por ya tener predicción de ${group.label}`);
-    }
-
-    if (Object.keys(subsAEnviar).length > 0) {
-      await enviarASubscriptores(subsAEnviar, group.label, Math.round(minutosPara));
+    // Se envía a TODOS los suscritos, hayan pronosticado o no.
+    if (Object.keys(subsTodas).length > 0) {
+      await enviarASubscriptores(subsTodas, group.label, primero.ts, Math.round(minutosPara));
     }
 
     await fbSet(`notificado/${group.key}/${slot}`, true);
