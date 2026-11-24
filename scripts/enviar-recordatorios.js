@@ -155,7 +155,7 @@ function slotPara(minutosPara) {
   return null;
 }
 
-const DIAS_SEMANA = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+const DIAS_SEMANA = ["dom", "lun", "mar", "mié", "jue", "vie", "sáb"];
 const MINUTOS_CIERRE_ANTES = 30; // mismo criterio que esCerrado() en el index.html
 
 // Cierre de predicciones = kickoff − 30 min, expresado en hora CDMX (UTC-6).
