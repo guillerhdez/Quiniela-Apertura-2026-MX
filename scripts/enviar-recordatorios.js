@@ -24,9 +24,10 @@
 // en el index.html. A todos los suscriptores se les envía el aviso: ya no se
 // omite a quien ya pronosticó.
 //
-// Liguilla: cada fase se divide en grupo de IDA y grupo de VUELTA (ids pares =
-// ida, impares = vuelta, según CUARTOS_SERIES / SEMIS_META / FINAL_META del
-// index.html). Cada grupo avisa por separado con su propio primer partido.
+// Liguilla: cada fase se divide en IDA y VUELTA (ids pares = ida, impares =
+// vuelta, según CUARTOS_SERIES / SEMIS_META / FINAL_META del index.html) y,
+// dentro de cada una, en un grupo POR DÍA de partidos. Cada día avisa por
+// separado (90 y 60 min) con el primer partido de ESE día.
 // FECHA_LIGUILLA hoy son textos como "Por definir" o "2026-11-25 (o 26)"
 // (no una hora exacta) — mientras no tengan el formato estricto
 // "YYYY-MM-DD HH:MM", ese grupo simplemente se salta (no es un error).
@@ -103,7 +104,9 @@ function buildGroups(PG_LIGAMX, FECHA_LIGUILLA) {
   }
 
   // Cada fase se separa en IDA y VUELTA (ver CUARTOS_SERIES / SEMIS_META /
-  // FINAL_META en el index.html: idaId pares, vueltaId impares).
+  // FINAL_META en el index.html: idaId pares, vueltaId impares) y, además,
+  // en un grupo POR DÍA de partidos (fecha CDMX): cada día de Liguilla tiene
+  // su propio par de avisos, calculado con el primer partido de ese día.
   const fasesLiguilla = [
     { key: "liguilla_cuartos_ida", label: "Partido de Ida", ids: [154, 156, 158, 160] },
     { key: "liguilla_cuartos_vuelta", label: "Partido de Vuelta", ids: [155, 157, 159, 161] },
@@ -122,7 +125,14 @@ function buildGroups(PG_LIGAMX, FECHA_LIGUILLA) {
         return m ? { id, fecha: m[1], hora: m[2] } : null;
       })
       .filter(Boolean);
-    groups.push({ key: fase.key, label: fase.label, partidos });
+
+    // Un grupo por fecha. La fecha entra en la clave de control de duplicados
+    // (notificado/{key}/{slot}), así cada día se marca por separado.
+    const porFecha = {};
+    for (const p of partidos) (porFecha[p.fecha] = porFecha[p.fecha] || []).push(p);
+    for (const [fecha, delDia] of Object.entries(porFecha)) {
+      groups.push({ key: `${fase.key}_${fecha}`, label: fase.label, partidos: delDia });
+    }
   }
 
   return groups;
